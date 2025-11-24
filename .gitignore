@@ -1,23 +1,16 @@
 # Python
 __pycache__/
-*.py[cod]
-*$py.class
-*.so
-.Python
-build/
-develop-eggs/
-dist/
-downloads/
-eggs/
-.eggs/
-lib64/
-parts/
-sdist/
-var/
-wheels/
-*.egg-info/
-.installed.cfg
-*.egg
+__pycache__/
+*.pyc
+.env
+.venv
+venv/
+*.pth
+*.h5
+*.pkl
+*.npy
+*.npz
+.DS_Store
 
 # Virtual Environment
 venv/
