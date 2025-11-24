@@ -1,13 +1,24 @@
 #!/bin/bash
 
-# Create build directory if it doesn't exist
-mkdir -p build
+# Exit on error
+set -e
 
-# Install Python dependencies
+# Install dependencies
+echo "Installing Python dependencies..."
 pip install -r requirements.txt
 
-# Create a simple serverless function for Netlify
+# Create build directory
+echo "Creating build directory..."
+mkdir -p build
+
+# Copy necessary files to build directory
+echo "Copying files to build directory..."
+cp -r static templates app.py build/
+
+# Create serverless function
+echo "Creating serverless function..."
 mkdir -p functions
+
 cat > functions/app.py << 'EOF'
 from app import app
 from flask import Response, request
@@ -31,7 +42,7 @@ def handler(event, context):
                 headers = {k.lower(): v for k, v in event.get('headers', {}).items()}
                 body = event.get('body', '')
                 query_string = event.get('queryStringParameters', '')
-                if query_string:
+                if isinstance(query_string, dict):
                     query_string = '&'.join([f"{k}={v}" for k, v in query_string.items()])
         else:
             # Direct function invocation
@@ -64,10 +75,8 @@ def handler(event, context):
             'body': response.get_data(as_text=True)
         }
 
-# For local testing
 if __name__ == '__main__':
     app.run(debug=True)
 EOF
 
-# Make the build script executable
-chmod +x build.sh
+echo "Build completed successfully!"

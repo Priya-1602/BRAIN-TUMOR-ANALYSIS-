@@ -1,17 +1,22 @@
 [build]
-  command = "pip install -r requirements.txt"
+  command = "pip install -r requirements.txt && python build.sh"
   publish = "build"
   functions = "functions"
+
+[build.environment]
+  PYTHON_VERSION = "3.9.0"
 
 [dev]
   command = "python app.py"
   port = 5000
   publish = "build"
+  targetPort = 5000
 
 [[redirects]]
   from = "/*"
   to = "/.netlify/functions/app"
   status = 200
+  force = true
 
 [[headers]]
   for = "/*"
@@ -20,3 +25,4 @@
     X-XSS-Protection = "1; mode=block"
     X-Content-Type-Options = "nosniff"
     Referrer-Policy = "strict-origin-when-cross-origin"
+    Cache-Control = "public, max-age=0, must-revalidate"
