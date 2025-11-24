@@ -4,7 +4,7 @@ import torch
 import torch.nn as nn
 from torchvision.models import vit_b_16
 from torchvision import transforms
-from PIL import Image, ImageDraw
+from PIL import Image
 import json
 import numpy as np
 import matplotlib
@@ -12,24 +12,44 @@ matplotlib.use('Agg')
 import matplotlib.pyplot as plt
 from captum.attr import LayerGradCam
 
+# Clear CUDA cache at the start
+if torch.cuda.is_available():
+    torch.cuda.empty_cache()
+
 # Resolve paths relative to this file
 HERE = os.path.dirname(__file__)
 
-# Load class names relative to repo layout
+# Load class names
 CLASSES_PATH = os.path.abspath(os.path.join(HERE, 'classes.json'))
 with open(CLASSES_PATH) as f:
     class_names = json.load(f)
 
-# Device
-device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+# Device - force CPU to save memory
+device = torch.device("cpu")
 
-# Load model
-model = vit_b_16(weights=None)
-model.heads.head = nn.Linear(model.heads.head.in_features, len(class_names))
-MODEL_PATH = os.path.abspath(os.path.join(HERE, '..', 'models', 'vit_brain_tumor.pth'))
-model.load_state_dict(torch.load(MODEL_PATH, map_location=device))
-model.to(device)
-model.eval()
+# Initialize model variable
+model = None
+
+def load_model():
+    """Load the model only when needed to save memory"""
+    global model
+    if model is not None:
+        return model
+        
+    # Clear CUDA cache before loading model
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
+    
+    # Load model with minimal memory footprint
+    with torch.no_grad():
+        model = vit_b_16(weights=None)
+        model.heads.head = nn.Linear(model.heads.head.in_features, len(class_names))
+        MODEL_PATH = os.path.abspath(os.path.join(HERE, '..', 'models', 'vit_brain_tumor.pth'))
+        model.load_state_dict(torch.load(MODEL_PATH, map_location=device))
+        model.to(device)
+        model.eval()
+    
+    return model
 
 # Transform
 transform = transforms.Compose([
@@ -40,43 +60,97 @@ transform = transforms.Compose([
 
 # Prediction function
 def predict_image(image_path):
+    """Make prediction with memory optimization"""
+    # Load model only when needed
+    model = load_model()
+    
     image = Image.open(image_path).convert("RGB")
-    # Test-time augmentation: identity and horizontal flip
-    imgs = [image, image.transpose(Image.FLIP_LEFT_RIGHT)]
-    prob_accum = None
+    imgs = [image, image.transpose(Image.FLIP_LEFT_RIGHT)]  # Test-time augmentation
+    
     with torch.no_grad():
+        model.eval()
+        prob_accum = None
+        
         for im in imgs:
             img_tensor = transform(im).unsqueeze(0).to(device)
             logits = model(img_tensor)
             probs = torch.softmax(logits, dim=1)
-            prob_accum = probs if prob_accum is None else (prob_accum + probs)
-        probs = prob_accum / len(imgs)
-        pred_idx = torch.argmax(probs, dim=1).item()
-    return class_names[pred_idx], probs.cpu().numpy()[0]
+            prob_accum = probs if prob_accum is None else prob_accum + probs
+            
+            # Clear memory after each prediction
+            del img_tensor, logits
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
+        
+        prob_accum /= len(imgs)
+        pred_idx = torch.argmax(prob_accum).item()
+        confidence = prob_accum[0][pred_idx].item()
+        
+    return pred_idx, confidence, prob_accum[0].cpu().numpy()
 
-# Grad-CAM function
-target_layer = model.conv_proj
-gradcam = LayerGradCam(model, target_layer)
+# Grad-CAM - only initialize when needed
+gradcam = None
+
+def get_gradcam():
+    """Lazy initialization of Grad-CAM to save memory"""
+    global gradcam
+    if gradcam is None:
+        model = load_model()
+        target_layer = model.conv_proj
+        gradcam = LayerGradCam(model, target_layer)
+    return gradcam
 
 def generate_gradcam(image_path, output_dir=None, save_path=None):
-    image = Image.open(image_path).convert("RGB")
-    input_tensor = transform(image).unsqueeze(0).to(device)
-    model.zero_grad()
-    output = model(input_tensor)
-    pred_class = output.argmax(dim=1).item()
-    attributions = gradcam.attribute(input_tensor, target=pred_class)
-    cam = attributions[0].mean(0).cpu().detach().numpy()
-    cam = (cam - cam.min()) / (cam.max() - cam.min() + 1e-8)
-    cam = cam.reshape(14, 14)
-    cam_resized = np.array(Image.fromarray(cam).resize(image.size, resample=Image.BILINEAR))
+    """Generate Grad-CAM visualization with memory optimization"""
+    # Load model and get gradcam only when needed
+    model = load_model()
+    gradcam = get_gradcam()
+    
+    try:
+        # Load and preprocess image
+        image = Image.open(image_path).convert("RGB")
+        input_tensor = transform(image).unsqueeze(0).to(device)
+        
+        # Get prediction
+        with torch.no_grad():
+            model.eval()
+            output = model(input_tensor)
+            pred_class = output.argmax(dim=1).item()
+        
+        # Generate Grad-CAM
+        model.zero_grad()
+        attributions = gradcam.attribute(input_tensor, target=pred_class)
+        cam = attributions[0].mean(0).cpu().detach().numpy()
+        cam = (cam - cam.min()) / (cam.max() - cam.min() + 1e-8)
+        
+        # Clean up
+        del input_tensor, output, attributions
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+            
+        return cam, pred_class
+        
+    except Exception as e:
+        print(f"Error in generate_gradcam: {str(e)}")
+        raise
+        # Resize CAM to match input image size
+        cam = cam.reshape(14, 14)
+        cam_resized = np.array(Image.fromarray(cam).resize(image.size, resample=Image.BILINEAR))
 
-    # --- Brain foreground mask to keep hotspot inside the head ---
-    # Build a coarse brain mask from grayscale intensity (MRI background is usually dark)
-    gray = np.asarray(image.convert('L')).astype('float32') / 255.0
-    thr_fg = max(0.20, float(np.quantile(gray, 0.35)))
-    brain_mask = (gray > thr_fg).astype(np.uint8)
-    H, W = brain_mask.shape
-    # Morphological cleanup: dilate then erode (closing), followed by erosion to avoid skull rim
+        # --- Brain foreground mask to keep hotspot inside the head ---
+        # Build a coarse brain mask from grayscale intensity (MRI background is usually dark)
+        gray = np.asarray(image.convert('L')).astype('float32') / 255.0
+        thr_fg = max(0.20, float(np.quantile(gray, 0.35)))
+        brain_mask = (gray > thr_fg).astype(np.uint8)
+        H, W = brain_mask.shape
+        
+        # Apply mask to CAM
+        cam_resized = cam_resized * brain_mask
+        
+        # Clean up more memory
+        del gray, brain_mask
+        
+        return cam_resized, pred_class
     def dilate3x3(m):
         pad = 1
         mp = np.pad(m, pad, mode='constant')
